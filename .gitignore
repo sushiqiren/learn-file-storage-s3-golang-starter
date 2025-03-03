@@ -2,4 +2,4 @@ out
 *.db
 .env
 assets/
-
+samples/
