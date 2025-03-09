@@ -77,6 +77,69 @@ func getVideoAspectRatio(filePath string) (string, error) {
 	}
 }
 
+func processVideoForFastStart(filePath string) (string, error) {
+	// Create output file path by appending .processing to the input file
+	outputFilePath := filePath + ".processing"
+
+	// Create the ffmpeg command with verbose logging
+	cmd := exec.Command(
+		"ffmpeg",
+		"-i", filePath, // Input file
+		"-c", "copy", // Copy the streams without re-encoding
+		"-movflags", "+faststart", // Add fast start flags for web playback (note the + sign)
+		"-f", "mp4", // Ensure output format is mp4
+		"-y",           // Overwrite output file if it exists
+		outputFilePath, // Output file
+	)
+
+	// Capture stderr for debugging
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	// Execute the command
+	err := cmd.Run()
+	if err != nil {
+		return "", fmt.Errorf("failed to process video for fast start: %v, stderr: %s", err, stderr.String())
+	}
+
+	// Verify the file was created and is not empty
+	fileInfo, err := os.Stat(outputFilePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to stat processed file: %v", err)
+	}
+
+	if fileInfo.Size() == 0 {
+		return "", fmt.Errorf("processed file is empty")
+	}
+
+	return outputFilePath, nil
+}
+
+func verifyFastStart(filePath string) error {
+	// Run ffprobe to check moov atom position
+	cmd := exec.Command(
+		"ffprobe",
+		"-v", "error",
+		"-show_entries", "format=format_name",
+		"-select_streams", "v:0",
+		"-show_entries", "stream=width,height",
+		"-of", "json",
+		filePath,
+	)
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	err := cmd.Run()
+	if err != nil {
+		return fmt.Errorf("failed to verify fast start: %v", err)
+	}
+
+	// You could check the output here but it's not a reliable way to verify moov location
+
+	return nil
+}
+
 func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request) {
 	const uploadLimit = 1 << 30
 	r.Body = http.MaxBytesReader(w, r.Body, uploadLimit)
@@ -127,14 +190,16 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	tempFile, err := os.CreateTemp("", "tubely-upload.mp4")
+	// Create a temporary file to save the uploaded video
+	tempFile, err := os.CreateTemp("", "tubely-upload-*.mp4")
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Could not create temp file", err)
 		return
 	}
-	defer os.Remove(tempFile.Name())
+	defer os.Remove(tempFile.Name()) // Clean up original temp file
 	defer tempFile.Close()
 
+	// Copy the uploaded file to the temporary file
 	if _, err := io.Copy(tempFile, file); err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Could not write file to disk", err)
 		return
@@ -149,31 +214,49 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 
 	// Determine the prefix based on the aspect ratio
 	var prefix string
-	if aspectRatio == "16:9" {
+	switch aspectRatio {
+	case "16:9":
 		prefix = "landscape"
-	} else if aspectRatio == "9:16" {
+	case "9:16":
 		prefix = "portrait"
-	} else {
+	default:
 		prefix = "other"
 	}
 
-	// Reset the file pointer to the beginning
-	_, err = tempFile.Seek(0, io.SeekStart)
+	// Process the video for fast start
+	processedFilePath, err := processVideoForFastStart(tempFile.Name())
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Could not reset file pointer", err)
+		respondWithError(w, http.StatusInternalServerError, "Could not process video for fast start", err)
 		return
+	}
+	defer os.Remove(processedFilePath) // Clean up processed temp file
+
+	// Open the processed file for uploading
+	processedFile, err := os.Open(processedFilePath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Could not open processed file", err)
+		return
+	}
+	defer processedFile.Close()
+
+	// Log file info for debugging
+	if fileInfo, err := os.Stat(processedFilePath); err == nil {
+		fmt.Printf("Processed file size: %d bytes\n", fileInfo.Size())
 	}
 
 	// Generate a unique key with the aspect ratio prefix
 	fileExt := filepath.Ext(handler.Filename)
+	if fileExt == "" {
+		fileExt = ".mp4" // Default to .mp4 if no extension
+	}
 	fileName := strings.ReplaceAll(videoID.String(), "-", "")
 	key := fmt.Sprintf("%s/%s%s", prefix, fileName, fileExt)
 
-	// Upload the video file to S3
+	// Upload the processed video file to S3
 	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
 		Bucket:      aws.String(cfg.s3Bucket),
 		Key:         aws.String(key),
-		Body:        tempFile,
+		Body:        processedFile,
 		ContentType: aws.String(mediaType),
 	})
 	if err != nil {
